@@ -1,6 +1,7 @@
 from ursina import *
 from ursina.prefabs.first_person_controller import FirstPersonController
-import random  # הוספתי לייבוא כדי ליצור מיקומים אקראיים לזומבים
+from direct.actor.Actor import Actor
+import random
 
 app = Ursina()
 
@@ -18,6 +19,20 @@ BLOCK_TYPES = [
     {'name': 'Water', 'texture': 'white_cube', 'color': color.rgba(0, 100, 255, 150), 'break_time': 0.1},
 ]
 
+ARMOR_TYPES = [
+    {
+        'name': 'diamond_chestplate',
+        'material': 'diamond',
+        'type': 'chestplate',
+        'texture': 'diamond_chestplate_2.png',
+        'protection': 5,
+        'durability': 50,
+        'color': color.cyan
+    }
+]
+
+
+
 # Global Variables
 selected_index = 0
 current_block = None
@@ -26,103 +41,148 @@ place_cooldown = 0
 last_safe_position = Vec3(0, 0, 0)
 reach_distance = 7
 last_hovered = None
+current_item = None
 
-hit_sound = Audio('mine-stone-with-a-pickaxe-333694.mp3', loop=True, autoplay=False)
+# Audio
+hit_sound = Audio('mine-stone-with-a-pickaxe-333694.mp3', loop=False, autoplay=False)
 respawn_sound = Audio('item_respawn-91422.mp3', loop=False, autoplay=False)
 damage_sound = Audio('suffering-damage-284365.mp3', loop=False, autoplay=False)
-background_sound = Audio('background-music-224633.mp3',loop=True,autoplay=True)
+background_sound = Audio('background-music-224633.mp3', loop=True, autoplay=True)
 
 
-# --- Zombie Class ---
+# --- ZOMBIE CLASS (FIXED) ---
 class Zombie(Entity):
     def __init__(self, position=(0, 1, 0)):
         super().__init__(
-            model='cube', color=color.green, texture='brick',
             position=position,
-            scale=(1, 2, 1),
-            origin_y=-0.5,  # הופך את התחתית שלו לנקודת המיקום
+            model=None,
             collider='box'
         )
+
+        # 1. Physics & Stats
+        self.collider = BoxCollider(self, center=Vec3(0, 1, 0), size=Vec3(1, 2, 1))
         self.hp = 100
         self.max_hp = 100
         self.knockback_direction = Vec3(0, 0, 0)
         self.knockback_intensity = 0
-        self.fall_speed = 0  # מהירות הנפילה הנוכחית
+        self.fall_speed = 0
+        self.old_position = self.position
 
-        # מד בריאות
-        self.health_bar_bg = Entity(parent=self, model='quad', color=color.black, scale=(1.2, 0.1),
-                                    position=(0, 1.2, 0), billboard=True)
-        self.health_bar = Entity(parent=self.health_bar_bg, model='quad', color=color.red, scale=(1, 1),
-                                 position=(0, 0, -0.01), origin_x=-0.5, x=-0.5)
+        # This variable fixes the animation stuttering
+        self.is_moving = False
+
+        # 2. Load the 3D Model
+        try:
+            # IMPORTANT: Make sure your file is named 'zombie.glb' in the folder
+            self.actor = Actor('zombie.glb.gltf')
+            self.actor.reparent_to(self)
+
+            # Scale and Texture
+            self.actor.scale = 1  # If too big, change to 0.1. If too small, change to 5.
+            self.actor.y = 0  # Align feet to floor
+
+            zombie_tex = load_texture('zombie.png')
+            if zombie_tex:
+                self.actor.set_texture(zombie_tex, 1)
+
+            # Start Idle Animation
+            self.actor.loop("all_the_time")
+            print("Zombie Model Loaded Successfully!")
+
+        except Exception as e:
+            # If you see the Green Block, look at the Console for this error message!
+            print(f"ZOMBIE FAILED TO LOAD: {e}")
+            self.actor = Entity(parent=self, model='cube', color=color.green, scale=(0.8, 1.8, 0.8), y=1)
+
+        # 3. Health Bar
+        self.health_bar_bg = Entity(parent=self, model='quad', color=color.black,
+                                    scale=(1.2, 0.1), position=(0, 2.2, 0), billboard=True)
+        self.health_bar = Entity(parent=self.health_bar_bg, model='quad', color=color.red,
+                                 scale=(1, 1), position=(0, 0, -0.01), origin_x=-0.5, x=-0.5)
 
     def update_hp_bar(self):
-        self.health_bar.scale_x = max(0, self.hp / self.max_hp)
+        if hasattr(self, 'health_bar'):
+            self.health_bar.scale_x = max(0, self.hp / self.max_hp)
 
     def take_damage(self, amount, knock_from=None):
         self.hp -= amount
         self.update_hp_bar()
-        damage_sound.play()
-        invoke(damage_sound.stop, delay=1)
 
-        if knock_from:
-            self.knockback_direction = (self.world_position - knock_from).normalized()
-            self.knockback_intensity = 8
+        if not damage_sound.playing:
+            damage_sound.play()
+            invoke(damage_sound.stop, delay=1)
 
-        original_color = self.color
-        self.color = color.red
-        invoke(setattr, self, 'color', original_color, delay=0.1)
+        if knock_from is not None:
+            diff = self.world_position - knock_from
+            self.knockback_direction = Vec3(diff.x, 0, diff.z).normalized()
+            self.knockback_intensity = 10
+
+        # Flash Red effect
+        if hasattr(self, 'actor'):
+            original_color = self.actor.color
+            self.actor.color = color.red
+            invoke(setattr, self.actor, 'color', original_color, delay=0.1)
+
         if self.hp <= 0:
             destroy(self)
 
     def update(self):
-        # 1. לוגיקת כוח משיכה (Gravity)
-        # יורים קרן מהמרכז של הזומבי כלפי מטה
-        # ה-distance הוא 1.0 כי גובה הזומבי הוא 2 (המרכז הוא ב-1)
-        ray = raycast(self.world_position + Vec3(0, 0.1, 0), Vec3(0, -1, 0), distance=1.1, ignore=(self,))
+        # 1. GRAVITY
+        ray = raycast(self.world_position + Vec3(0, 0.5, 0), Vec3(0, -1, 0), distance=0.6, ignore=(self,))
 
         if not ray.hit:
-            # אם אין כלום מתחת לזומבי - הוא נופל
-            self.fall_speed += 20 * time.dt  # האצה כלפי מטה
+            self.fall_speed += 20 * time.dt
             self.y -= self.fall_speed * time.dt
         else:
-            # אם הוא נגע בקרקע - הוא עוצר
             self.fall_speed = 0
-            # יישור קטן כדי שלא ישקע בבלוק
-            self.y = ray.point.y
+            if self.y < ray.point.y:
+                self.y = ray.point.y
 
-            # 2. טיפול ב-Knockback
+        # 2. KNOCKBACK
         if self.knockback_intensity > 0:
-            self.position += self.knockback_direction * self.knockback_intensity * time.dt
-            self.knockback_intensity -= 20 * time.dt
+            move_dir = self.knockback_direction
+            wall_check = raycast(self.world_position + Vec3(0, 1, 0), move_dir, distance=1, ignore=(self,))
+            if not wall_check.hit:
+                self.position += move_dir * self.knockback_intensity * time.dt
+            self.knockback_intensity -= 25 * time.dt
 
-            # 3. רדיפה (רק אם חי)
-        if self.hp > 0:
-            z_dist = distance(self.position, player.position)
-            if z_dist < 15:
-                # הזומבי מסתכל על השחקן אבל שומר על ציר ה-Y ישר (שלא יתהפך)
-                old_y = self.y
+        # 3. CHASE & ANIMATION LOGIC
+        if self.knockback_intensity <= 0:
+            dist = distance(self.position, player.position)
+
+            # Chase Logic
+            if 1.5 < dist < 20:
                 self.look_at(player)
                 self.rotation_x = 0
                 self.rotation_z = 0
-                self.position += self.forward * 2 * time.dt
-                self.y = old_y  # מוודא שהתנועה קדימה לא מבטלת את הנפילה
+                front_check = raycast(self.world_position + Vec3(0, 1, 0), self.forward, distance=1, ignore=(self,))
+                if not front_check.hit:
+                    self.position += self.forward * 2 * time.dt
+            elif dist <= 1.5:
+                hit_player(self, 400 * time.dt)
 
-                if z_dist < 1.5:
-                    player.hp -= 10 * time.dt
-                    update_health_ui()
-                    if not damage_sound.playing:
-                        damage_sound.play()
-                        invoke(damage_sound.stop, delay=1)
+        # 4. ANIMATION STATE MACHINE (This fixes the stuttering)
+        # Check if we moved since the last frame
+        is_moving_now = (self.position != self.old_position)
+
+        # Only switch animations if the state changed
+        if isinstance(self.actor, Actor):
+            if is_moving_now and not self.is_moving:
+                self.actor.loop('moving')  # Switch to walk
+                self.is_moving = True
+            elif not is_moving_now and self.is_moving:
+                self.actor.loop('all_the_time')  # Switch to idle
+                self.is_moving = False
+
+        self.old_position = self.position
 
 
 
 # --- Spawning System ---
 def spawn_zombie():
-    # יוצר זומבי במיקום אקראי על המפה (בין 0 ל-15)
     x = random.uniform(0, 15)
     z = random.uniform(0, 15)
-    Zombie(position=(x, 1, z))
-    # קורא לעצמו שוב בעוד 10 שניות
+    Zombie(position=(x, 5, z))
     invoke(spawn_zombie, delay=10)
 
 
@@ -141,7 +201,6 @@ selector = Entity(parent=camera.ui, model='quad', color=color.rgba(255, 255, 0, 
 
 
 # --- Logic Functions ---
-
 def update_hotbar():
     selector.position = hotbar_slots[selected_index].position
     hand.texture = BLOCK_TYPES[selected_index]['texture']
@@ -171,34 +230,61 @@ def stop_mining():
 
 def input(key):
     global selected_index
+
+    # Hotbar selection
     if key in ['1', '2', '3', '4', '5']:
         selected_index = int(key) - 1
         update_hotbar()
 
+    # Toggle Inventory correctly
     if key == 'e':
-        mouse.locked = not mouse.locked
         inventory.visible = not inventory.visible
+        # The mouse should be UNLOCKED when inventory is VISIBLE
+        mouse.locked = not inventory.visible
         add_item_button.visible = inventory.visible
 
+    # Combat
     if key == 'left mouse down':
         if mouse.hovered_entity and isinstance(mouse.hovered_entity, Zombie):
             if distance(mouse.hovered_entity.position, player.position) < 4:
-                # שליחת מיקום השחקן לצורך חישוב כיוון הרתע
                 mouse.hovered_entity.take_damage(20, knock_from=player.world_position)
 
     if key == 'left mouse up':
         stop_mining()
 
-    if key =='f':
+    # Music and Spawning
+    if key == 'f':
         if background_sound.playing:
             background_sound.stop()
         else:
             background_sound.play()
 
+    if key == 'c':
+        spawn_zombie()
+
+class Armor:
+    def __init__(self, material, type):
+        armor_name = f"{material}_{type}"
+        data = next((item for item in ARMOR_TYPES if item["name"] == armor_name), None)
+
+        if data:
+            self.name = data['name']
+            self.material = data['material'] # This is used for the UI text
+            self.type = data['type']
+            self.texture = data['texture']
+            self.protection = data['protection']
+            self.durability = data['durability']
+            self.color = data.get('color', color.cyan)
+        else:
+            print(f"Error: Armor {armor_name} not found!")
+            self.material = "None" # Fallback
+            self.type = type
+            self.protection = 0
+
 
 
 def update():
-    global break_timer, current_block, place_cooldown, last_safe_position, last_hovered
+    global break_timer, current_block, place_cooldown, last_safe_position, last_hovered,current_item
 
     if last_hovered and last_hovered != current_block:
         if isinstance(last_hovered, Voxel):
@@ -215,7 +301,7 @@ def update():
     if ground_check.hit:
         last_safe_position = player.position
 
-    # --- זיהוי מים ---
+    # --- Water Logic ---
     in_water = False
     for water_block in [e for e in scene.entities if isinstance(e, Water)]:
         if distance(water_block.position, player.position) < 1.2:
@@ -294,6 +380,15 @@ def update():
     if player.hp <= 0 or player.y <= -10:
         respawn_player()
 
+    if player.knockback_intensity > 0:
+        check = raycast(player.world_position + Vec3(0, 1, 0), player.knockback_direction, distance=1, ignore=(player,))
+        if not check.hit:
+            player.position += player.knockback_direction * player.knockback_intensity * time.dt
+        player.knockback_intensity -= 75 * time.dt
+        if player.knockback_intensity < 0:
+            player.knockback_intensity = 0
+
+    current_item = BLOCK_TYPES[selected_index]['name']
 
 
 def respawn_player():
@@ -304,32 +399,143 @@ def respawn_player():
     respawn_sound.play()
 
 
-
 # --- Inventory ---
+class InventoryItem(Draggable):
+    def __init__(self, parent_inv, texture, armor_object=None):
+        super().__init__(
+            parent=parent_inv,
+            model='quad',
+            texture=texture,
+            scale=(1 / 5, 1 / 2),
+            origin=(-0.5, 0.5)
+        )
+        self.armor_object = armor_object  # Stores the armor stats (if it is armor)
+
+    def input(self, key):
+        if self.hovered and key == 'right mouse down':
+            if self.armor_object is not None:
+                slot = self.armor_object.type
+
+                # OPTIONAL: If you're already wearing something, unequip it first
+                if player.equipped_armor[slot]:
+                    armor_ui.unequip_slot(slot)
+
+                # Equip the new armor
+                player.equipped_armor[slot] = self.armor_object
+
+                # --- NEW: Refresh the UI ---
+                armor_ui.refresh()
+
+                destroy(self)
+
+
 class Inventory(Entity):
     def __init__(self, width=5, height=2):
         super().__init__(parent=camera.ui, model='quad', scale=(width * 0.1, height * 0.1),
                          origin=(-0.5, 0.5), position=(-0.25, 0.25), color=color.black66, visible=False)
-        self.width, self.height, self.slots = width, height, []
+        self.width = width
+        self.height = height
+        self.slots = []
 
-    def append(self, item_texture):
-        item = Draggable(parent=self, model='quad', texture=item_texture, scale=(1 / 5, 1 / 2), origin=(-0.5, 0.5))
+    # Updated append to accept armor data
+    def append(self, item_texture, armor_data=None):
+        item = InventoryItem(self, item_texture, armor_data)
         self.slots.append(item)
 
 
 inventory = Inventory()
-add_item_button = Button(scale=.1, x=-.5, color=color.lime, text='+', on_click=lambda: inventory.append('grass'),
-                         visible=False)
+
+# Create the actual armor object using your Armor class
+test_chestplate = Armor("diamond", "chestplate")
+
+# Button to give the player the armor in their inventory
+add_item_button = Button(
+    scale=.1,
+    x=-.5,
+    color=color.lime,
+    text='+',
+    visible=False,
+    on_click=lambda: inventory.append(test_chestplate.texture, test_chestplate)
+)
+
+
+class ArmorDisplay(Entity):
+    def __init__(self):
+        super().__init__(parent=camera.ui, position=(-0.85, 0.4))  # Top left
+        self.labels = {}
+
+        # Create a line for each slot
+        slots = ['helmet', 'chestplate', 'leggings', 'boots']
+        for i, slot in enumerate(slots):
+            # The background button (Click this to unequip)
+            btn = Button(
+                parent=self,
+                text=f"{slot.capitalize()}: None",
+                scale=(0.25, 0.05),
+                position=(0, -i * 0.06),
+                color=color.black66,
+                on_click=lambda s=slot: self.unequip_slot(s)
+            )
+            self.labels[slot] = btn
+
+    def refresh(self):
+        for slot, btn in self.labels.items():
+            armor = player.equipped_armor[slot]
+            if armor:
+                btn.text = f"{slot.capitalize()}: {armor.material.capitalize()}"
+                btn.color = armor.color if hasattr(armor, 'color') else color.azure
+            else:
+                btn.text = f"{slot.capitalize()}: None"
+                btn.color = color.black66
+
+    def unequip_slot(self, slot):
+        armor = player.equipped_armor[slot]
+        if armor:
+            # 1. Put it back in inventory
+            inventory.append(armor.texture, armor)
+            # 2. Clear the player slot
+            player.equipped_armor[slot] = None
+            # 3. Update the screen
+            self.refresh()
+            print(f"Unequipped {slot}")
+
+
+# Initialize it
+armor_ui = ArmorDisplay()
+
+
 
 player = FirstPersonController()
 Sky()
 
-# התחלת מערכת ה-Spawning
+#player armor initial
+player.equipped_armor = {
+    'helmet': None,
+    'chestplate': None,
+    'leggings': None,
+    'boots': None
+}
+
+# 3.initialize the UI
+
+
+
+# Initial Spawns
 spawn_zombie()
 
+
+#player initial stats
 player.hp = 100
 player.max_hp = 100
 player.fall_start_y = player.y
+player.knockback_direction = Vec3(0, 0, 0)
+player.knockback_intensity = 0
+
+
+
+
+#how to equip armor
+#player.equipped_armor['chestplate'] = diamond_chest
 
 health_bar_bg = Entity(parent=camera.ui, model='quad', color=color.black66, scale=(0.4, 0.02), position=(0, -0.4))
 health_bar = Entity(parent=health_bar_bg, model='quad', color=color.red, scale=(1, 1), origin=(-0.5, 0), x=-0.5)
@@ -346,9 +552,38 @@ class Water(Entity):
         self.collision = False
 
 
+def hit_player(source_entity, damage):
+    #Calculate total protection from all worn armor
+    total_protection = 0
+    for armor_piece in player.equipped_armor.values():
+        if armor_piece is not None:
+            total_protection += armor_piece.protection
+
+    #Subtract protection from the incoming damage
+    actual_damage = damage - total_protection
+
+    # Make sure damage doesn't heal the player if protection is higher!
+    if actual_damage < 0:
+        actual_damage = 0
+
+    #Apply the damage
+    player.hp -= actual_damage
+    update_health_ui()
+
+    #Apply Knockback
+    diff = player.world_position - source_entity.world_position
+    player.knockback_direction = Vec3(diff.x, 0, diff.z).normalized()
+    player.knockback_intensity = 15-total_protection
+    camera.shake(duration=0.1, magnitude=1)
+
+
+
+
+
+
+# Generate World
 for z in range(16):
     for x in range(16): Voxel(position=(x, 0, z))
 for z in range(5, 8):
     for x in range(5, 8): Water(position=(x, 1, z))
-
 app.run()
